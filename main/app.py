@@ -136,6 +136,10 @@ def show_login():
 if "authenticated" not in st.session_state: st.session_state.authenticated = False
 if "chat_history"  not in st.session_state: st.session_state.chat_history  = []
 if "indexed_files" not in st.session_state: st.session_state.indexed_files = []
+if "pdf_bytes"     not in st.session_state: st.session_state.pdf_bytes     = {}
+if "pdf_texts"     not in st.session_state: st.session_state.pdf_texts     = {}
+if "summaries"     not in st.session_state: st.session_state.summaries     = {}  # filename → summary
+if "quiz_data"     not in st.session_state: st.session_state.quiz_data     = {}  # filename → quiz list
 
 if not st.session_state.authenticated:
     show_login()
@@ -191,16 +195,29 @@ with st.sidebar:
     if uploaded_files:
         if st.button("⚡ Index PDFs", use_container_width=True):
             from rag_backend import process_pdfs, split_documents
+            from pathlib import Path
             with st.spinner("Processing…"):
-                tmp_paths = []
+                tmp_paths   = []
+                path_to_name = {}          # tmp basename → original filename
                 for uf in uploaded_files:
+                    raw = uf.read()
+                    st.session_state.pdf_bytes[uf.name] = raw
                     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-                    tmp.write(uf.read()); tmp.close()
+                    tmp.write(raw); tmp.close()
                     tmp_paths.append(tmp.name)
+                    path_to_name[Path(tmp.name).name] = uf.name
                 docs   = process_pdfs(tmp_paths)
                 chunks = split_documents(docs)
                 embeds = em.embed([c.page_content for c in chunks])
                 vs.add_documents(chunks, embeds)
+                # Build per-PDF text from loaded docs
+                for doc in docs:
+                    orig = path_to_name.get(
+                        doc.metadata.get("source_file", ""), "Unknown"
+                    )
+                    st.session_state.pdf_texts[orig] = (
+                        st.session_state.pdf_texts.get(orig, "") + " " + doc.page_content
+                    )
                 for tp in tmp_paths: os.unlink(tp)
                 st.session_state.indexed_files += [f.name for f in uploaded_files]
             st.success(f"✅ Indexed {len(chunks)} chunks!")
@@ -264,60 +281,385 @@ for col, num, label in [(c1, doc_count, "Chunks indexed"),
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-if doc_count == 0:
-    st.markdown("""
-    <div class="welcome-card">
-      <div style="font-size:3rem;">📂</div>
-      <h3>No documents indexed yet</h3>
-      <p>Upload PDFs from the sidebar, then click <b>⚡ Index PDFs</b>.</p>
-    </div>""", unsafe_allow_html=True)
+# ── Tabs ─────────────────────────────────────────────────────
+chat_tab, viewer_tab, summary_tab, quiz_tab = st.tabs(
+    ["💬 Chat", "📊 Insights", "📝 Summarizer", "🧠 Quiz Generator"]
+)
 
-# Chat history
-for msg in st.session_state.chat_history:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
-        if msg["role"] == "assistant":
-            meta = msg.get("meta")
-            if meta:
-                st.markdown(confidence_badge(meta["confidence"]), unsafe_allow_html=True)
-                if meta.get("sources"):
+# ═══════════════════════════════════════════════════════════════════════════════
+# INSIGHTS TAB — text-based visuals from PDF content
+# ═══════════════════════════════════════════════════════════════════════════════
+with viewer_tab:
+    pdf_texts = st.session_state.pdf_texts
+    if not pdf_texts:
+        st.markdown("""
+        <div class="welcome-card">
+          <div style="font-size:3rem;">📂</div>
+          <h3>No PDFs analysed yet</h3>
+          <p>Upload and index PDFs from the sidebar first.</p>
+        </div>""", unsafe_allow_html=True)
+    else:
+        import re
+        import io
+        import matplotlib.pyplot as plt
+        import plotly.express as px
+        from collections import Counter
+        from wordcloud import WordCloud, STOPWORDS
+
+        selected_pdf = st.selectbox(
+            "Select PDF", options=list(pdf_texts.keys()),
+            label_visibility="collapsed",
+        )
+        text = pdf_texts[selected_pdf]
+
+        # ─ Stats ─────────────────────────────────────────────────────────────
+        words     = re.findall(r"\b[a-zA-Z]{2,}\b", text)
+        sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+        unique_w  = len(set(w.lower() for w in words))
+        avg_sent  = round(len(words) / max(len(sentences), 1), 1)
+
+        s1, s2, s3, s4 = st.columns(4)
+        for col, val, label in [
+            (s1, f"{len(words):,}",   "Total words"),
+            (s2, f"{unique_w:,}",     "Unique words"),
+            (s3, f"{len(sentences):,}","Sentences"),
+            (s4, f"{avg_sent}",        "Words / sentence"),
+        ]:
+            col.markdown(
+                f'<div class="stat-card"><div class="stat-number">{val}</div>'
+                f'<div class="stat-label">{label}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        left_col, right_col = st.columns([1, 1])
+
+        # ─ Word cloud ──────────────────────────────────────────────────────────
+        with left_col:
+            st.markdown("**☁️ Word Cloud**")
+            wc = WordCloud(
+                width=800, height=450,
+                background_color="white",
+                stopwords=STOPWORDS,
+                colormap="Blues",
+                max_words=150,
+                collocations=False,
+            ).generate(text)
+            fig_wc, ax = plt.subplots(figsize=(8, 4.5))
+            ax.imshow(wc, interpolation="bilinear")
+            ax.axis("off")
+            plt.tight_layout(pad=0)
+            buf = io.BytesIO()
+            fig_wc.savefig(buf, format="png", dpi=150, bbox_inches="tight")
+            plt.close(fig_wc)
+            st.image(buf.getvalue(), use_container_width=True)
+
+        # ─ Top keywords bar chart ─────────────────────────────────────────────
+        with right_col:
+            st.markdown("**🔍 Top 20 Keywords**")
+            stop = STOPWORDS | {
+                "also", "one", "two", "three", "may", "use",
+                "used", "using", "would", "could", "said",
+                "per", "etc", "eg", "ie",
+            }
+            freq  = Counter(
+                w.lower() for w in words if w.lower() not in stop and len(w) > 2
+            )
+            top20 = freq.most_common(20)
+            if top20:
+                kw, cnt = zip(*top20)
+                fig_bar = px.bar(
+                    x=list(cnt)[::-1], y=list(kw)[::-1],
+                    orientation="h",
+                    labels={"x": "Frequency", "y": ""},
+                    color=list(cnt)[::-1],
+                    color_continuous_scale="Blues",
+                )
+                fig_bar.update_layout(
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    showlegend=False,
+                    coloraxis_showscale=False,
+                    height=420,
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+        # ─ Text preview ─────────────────────────────────────────────────────────
+        with st.expander("📄 Extracted text preview"):
+            st.text(text[:3000] + ("…" if len(text) > 3000 else ""))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUMMARIZER TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+with summary_tab:
+    if not st.session_state.pdf_texts:
+        st.markdown("""
+        <div class="welcome-card">
+          <div style="font-size:3rem;">📝</div>
+          <h3>No PDFs indexed yet</h3>
+          <p>Upload and index PDFs from the sidebar first.</p>
+        </div>""", unsafe_allow_html=True)
+    else:
+        sum_pdf = st.selectbox(
+            "Select PDF to summarise",
+            options=list(st.session_state.pdf_texts.keys()),
+            key="sum_pdf_select",
+            label_visibility="collapsed",
+        )
+        sum_text = st.session_state.pdf_texts[sum_pdf]
+
+        gen_col, _ = st.columns([1, 3])
+        with gen_col:
+            gen_btn = st.button("📝 Generate Summary", use_container_width=True,
+                                key="gen_summary_btn")
+
+        if gen_btn or sum_pdf in st.session_state.summaries:
+            if gen_btn or sum_pdf not in st.session_state.summaries:
+                with st.spinner("🧠 Summarising — please wait…"):
+                    prompt = f"""You are a professional document analyst. Analyse the following PDF text and provide a structured summary.
+
+Return your answer in EXACTLY this format (use these headers):
+
+## Overview
+<3-5 sentence overview of the document>
+
+## Key Points
+- <point 1>
+- <point 2>
+- <point 3>
+- <point 4>
+- <point 5>
+
+## Main Topics
+<comma-separated list of main topics/themes>
+
+Document text:
+{sum_text[:8000]}"""
+                    llm = get_llm(model_choice, 0.3)
+                    response = llm.invoke(prompt)
+                    st.session_state.summaries[sum_pdf] = response.content
+
+            summary_text = st.session_state.summaries[sum_pdf]
+
+            # Parse and display sections
+            sections = {"Overview": "", "Key Points": "", "Main Topics": ""}
+            current = None
+            for line in summary_text.splitlines():
+                if "## Overview" in line:      current = "Overview"
+                elif "## Key Points" in line:   current = "Key Points"
+                elif "## Main Topics" in line:  current = "Main Topics"
+                elif current:
+                    sections[current] += line + "\n"
+
+            st.markdown(f"### 📄 Summary — *{sum_pdf}*")
+            st.divider()
+
+            ov_col, kp_col = st.columns([1, 1])
+            with ov_col:
+                st.markdown("#### 📖 Overview")
+                st.markdown(sections["Overview"].strip() or summary_text[:600])
+            with kp_col:
+                st.markdown("#### ✅ Key Points")
+                kp = sections["Key Points"].strip()
+                if kp:
+                    for point in kp.splitlines():
+                        if point.strip():
+                            st.markdown(point)
+
+            st.markdown("#### 🏷️ Main Topics")
+            mt = sections["Main Topics"].strip()
+            if mt:
+                for topic in mt.split(","):
+                    t = topic.strip()
+                    if t:
+                        st.markdown(
+                            f'<span style="background:#dbeafe;color:#1e40af;padding:4px 12px;'
+                            f'border-radius:20px;font-size:.85rem;margin:3px;display:inline-block">{t}</span>',
+                            unsafe_allow_html=True,
+                        )
+            st.markdown("<br>", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# QUIZ GENERATOR TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+with quiz_tab:
+    if not st.session_state.pdf_texts:
+        st.markdown("""
+        <div class="welcome-card">
+          <div style="font-size:3rem;">🧠</div>
+          <h3>No PDFs indexed yet</h3>
+          <p>Upload and index PDFs from the sidebar first.</p>
+        </div>""", unsafe_allow_html=True)
+    else:
+        import json
+
+        qz_col1, qz_col2, qz_col3 = st.columns([2, 1, 1])
+        with qz_col1:
+            quiz_pdf = st.selectbox(
+                "Select PDF", options=list(st.session_state.pdf_texts.keys()),
+                key="quiz_pdf_select", label_visibility="collapsed",
+            )
+        with qz_col2:
+            num_q = st.slider("Questions", 3, 10, 5, key="quiz_num_q")
+        with qz_col3:
+            quiz_btn = st.button("🧠 Generate Quiz", use_container_width=True, key="gen_quiz_btn")
+
+        quiz_key = f"{quiz_pdf}__{num_q}"
+
+        if quiz_btn:
+            quiz_text = st.session_state.pdf_texts[quiz_pdf]
+            with st.spinner(f"🧠 Generating {num_q} questions…"):
+                prompt = f"""You are a quiz generator. Create exactly {num_q} multiple-choice questions from the text below.
+Return ONLY a valid JSON array — no explanation, no markdown fences, just the raw JSON.
+Each object must have these exact keys:
+  "question": string
+  "options": array of 4 strings, each starting with A) B) C) D)
+  "answer": one of "A", "B", "C", "D"
+
+Text:
+{quiz_text[:6000]}"""
+                llm = get_llm(model_choice, 0.4)
+                raw = llm.invoke(prompt).content.strip()
+                # strip markdown fences if model adds them
+                raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+                try:
+                    questions = json.loads(raw)
+                    st.session_state.quiz_data[quiz_key] = {
+                        "questions": questions,
+                        "answers":   {},  # q_index → chosen option letter
+                        "submitted": False,
+                    }
+                except Exception:
+                    st.error("❌ Could not parse quiz JSON. Try again.")
+                    st.code(raw)
+
+        if quiz_key in st.session_state.quiz_data:
+            qd        = st.session_state.quiz_data[quiz_key]
+            questions = qd["questions"]
+            submitted = qd["submitted"]
+
+            st.markdown(f"### 🧠 Quiz — *{quiz_pdf}* ({len(questions)} questions)")
+            st.divider()
+
+            with st.form("quiz_form"):
+                for i, q in enumerate(questions):
+                    st.markdown(f"**Q{i+1}. {q['question']}**")
+                    chosen = st.radio(
+                        f"q{i}",
+                        options=q["options"],
+                        index=None,
+                        key=f"quiz_radio_{quiz_key}_{i}",
+                        label_visibility="collapsed",
+                        disabled=submitted,
+                    )
+                    if chosen:
+                        qd["answers"][i] = chosen[0]  # store first char: A/B/C/D
+                    st.markdown("")
+
+                if st.form_submit_button(
+                    "✅ Submit Answers", use_container_width=True, disabled=submitted
+                ):
+                    qd["submitted"] = True
+                    st.rerun()
+
+            if submitted:
+                correct = sum(
+                    1 for i, q in enumerate(questions)
+                    if qd["answers"].get(i, "") == q.get("answer", "")
+                )
+                total   = len(questions)
+                pct     = int(correct / total * 100)
+                if pct >= 70:
+                    colour, emoji = "#d1fae5", "🏆"
+                elif pct >= 40:
+                    colour, emoji = "#fef9c3", "👍"
+                else:
+                    colour, emoji = "#fee2e2", "💪"
+
+                st.markdown(
+                    f'<div style="background:{colour};border-radius:12px;padding:1rem 1.5rem;'
+                    f'text-align:center;margin:1rem 0">'
+                    f'<span style="font-size:2rem">{emoji}</span>'
+                    f'<h3 style="margin:.3rem 0">Score: {correct}/{total} ({pct}%)</h3>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("#### Answer Review")
+                for i, q in enumerate(questions):
+                    user_ans    = qd["answers"].get(i, "—")
+                    correct_ans = q.get("answer", "")
+                    is_right    = user_ans == correct_ans
+                    icon        = "✅" if is_right else "❌"
+                    st.markdown(
+                        f"{icon} **Q{i+1}.** {q['question']}  \n"
+                        f"Your answer: **{user_ans}** · Correct: **{correct_ans}**"
+                    )
+
+                if st.button("🔄 Retake Quiz", key="retake_quiz"):
+                    del st.session_state.quiz_data[quiz_key]
+                    st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHAT TAB
+# ═══════════════════════════════════════════════════════════════════════════════
+with chat_tab:
+
+    if doc_count == 0:
+        st.markdown("""
+        <div class="welcome-card">
+          <div style="font-size:3rem;">📂</div>
+          <h3>No documents indexed yet</h3>
+          <p>Upload PDFs from the sidebar, then click <b>⚡ Index PDFs</b>.</p>
+        </div>""", unsafe_allow_html=True)
+
+    # Chat history
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+            if msg["role"] == "assistant":
+                meta = msg.get("meta")
+                if meta:
+                    st.markdown(confidence_badge(meta["confidence"]), unsafe_allow_html=True)
+                    if meta.get("sources"):
+                        with st.expander("📎 Source documents"):
+                            for s in meta["sources"]:
+                                st.markdown(
+                                    f'<div class="source-card"><b>📄 {s["source"]}</b>'
+                                    f' · Page <b>{s["page"]}</b> · Score <b>{s["score"]:.2f}</b>'
+                                    f'<br><span style="color:#555">{s["preview"]}</span></div>',
+                                    unsafe_allow_html=True)
+
+    # Input
+    query = st.chat_input("Ask a question about your documents…" if doc_count > 0
+                          else "Upload and index a PDF first…")
+
+    if query:
+        if doc_count == 0:
+            st.warning("⚠️ No documents indexed. Upload PDFs from the sidebar first.")
+        else:
+            with st.chat_message("user"):
+                st.write(query)
+            st.session_state.chat_history.append({"role": "user", "content": query})
+
+            with st.chat_message("assistant"):
+                with st.spinner("🔍 Searching and generating answer…"):
+                    from rag_backend import rag_enhanced
+                    llm    = get_llm(model_choice, temperature)
+                    result = rag_enhanced(query, retriever, llm,
+                                          top_k=top_k, min_score=min_score,
+                                          reranker=reranker)
+                st.write(result["answer"])
+                st.markdown(confidence_badge(result["confidence"]), unsafe_allow_html=True)
+                if result["sources"]:
                     with st.expander("📎 Source documents"):
-                        for s in meta["sources"]:
+                        for s in result["sources"]:
                             st.markdown(
                                 f'<div class="source-card"><b>📄 {s["source"]}</b>'
                                 f' · Page <b>{s["page"]}</b> · Score <b>{s["score"]:.2f}</b>'
                                 f'<br><span style="color:#555">{s["preview"]}</span></div>',
                                 unsafe_allow_html=True)
 
-# Input
-query = st.chat_input("Ask a question about your documents…" if doc_count > 0
-                      else "Upload and index a PDF first…")
-
-if query:
-    if doc_count == 0:
-        st.warning("⚠️ No documents indexed. Upload PDFs from the sidebar first.")
-    else:
-        with st.chat_message("user"):
-            st.write(query)
-        st.session_state.chat_history.append({"role": "user", "content": query})
-
-        with st.chat_message("assistant"):
-            with st.spinner("🔍 Searching and generating answer…"):
-                from rag_backend import rag_enhanced
-                llm    = get_llm(model_choice, temperature)
-                result = rag_enhanced(query, retriever, llm,
-                                      top_k=top_k, min_score=min_score,
-                                      reranker=reranker)
-            st.write(result["answer"])
-            st.markdown(confidence_badge(result["confidence"]), unsafe_allow_html=True)
-            if result["sources"]:
-                with st.expander("📎 Source documents"):
-                    for s in result["sources"]:
-                        st.markdown(
-                            f'<div class="source-card"><b>📄 {s["source"]}</b>'
-                            f' · Page <b>{s["page"]}</b> · Score <b>{s["score"]:.2f}</b>'
-                            f'<br><span style="color:#555">{s["preview"]}</span></div>',
-                            unsafe_allow_html=True)
-
-        st.session_state.chat_history.append(
-            {"role": "assistant", "content": result["answer"], "meta": result})
+            st.session_state.chat_history.append(
+                {"role": "assistant", "content": result["answer"], "meta": result})
