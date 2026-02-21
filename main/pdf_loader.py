@@ -183,7 +183,7 @@ class RAGRetriever:
                 ids= results['ids'][0]
 
                 for i, (doc_id, document, metadata, distance) in enumerate(zip(ids, documents, metadatas, distances)):
-                    similarity_score = 1 - distance
+                    similarity_score = 1 - (distance / 2)
                     if similarity_score >= score_threshold:
                         retrieved_docs.append({
                             'id': doc_id,
@@ -207,3 +207,83 @@ class RAGRetriever:
 rag_retriever=RAGRetriever(vector_store,embedding_manager)
 
 rag_retriever.retrieve("what is the name of the hackthon?")
+
+#simple RAG piple line with groq llm
+from langchain_groq import ChatGroq
+from dotenv import load_dotenv
+load_dotenv()
+
+
+groq_api_key= os.getenv("GROQ_API_KEY")
+groq_model_name = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
+llm= ChatGroq(groq_api_key= groq_api_key, model_name= groq_model_name, temperature= 0.7, max_tokens= 500)
+
+##simle rag function:retrieve context and generate response
+def rag_simple(query, retriever, llm, top_k=3):
+    result = retriever.retrieve(query, top_k=top_k, score_threshold=0.1)
+    if not result:
+        return "No relevant context found for the query."
+
+    context = "\n\n".join(
+        f"Document {doc['rank']} (Score: {doc['similarity_score']:.2f}):\n{doc['content']}"
+        for doc in result
+    )
+
+    prompt = (
+        "Answer the following question based only on the provided context.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {query}\n\n"
+        "Answer:"
+    )
+
+    response = llm.invoke(prompt)
+    return response.content.strip()
+
+answer= rag_simple("What is the name of the hackathon?", rag_retriever, llm)
+
+#enhanced rag pipline feaatures
+
+def rag_enhanced(query, retriever, llm, top_k=5, min_score=0.2, return_context=False):
+    results = retriever.retrieve(query, top_k=top_k, score_threshold=min_score)
+    if not results:
+        return {"answer":"No relevant context found for the query.", "sources": [], "confidence": 0.0, "context": ""}
+
+    context = "\n\n".join(
+        f"Document {doc['rank']} (Score: {doc['similarity_score']:.2f}):\n{doc['content']}"
+        for doc in results
+    )
+
+    sources=[{
+        'source': doc['metadata'].get('source_file', 'unknown'),
+        'page': doc['metadata'].get('page', 'unknown'),
+        'score': doc['similarity_score'],
+        'preview': doc['content'][:200] + "..." if len(doc['content']) > 200 else doc['content']
+    } for doc in results]
+    confidence= max(doc['similarity_score'] for doc in results)
+    prompt = (
+        "Answer the following question based only on the provided context.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {query}\n\n"
+        "Answer:"
+    )
+
+    response = llm.invoke(prompt)
+    response = response.content.strip()
+
+    output= {
+        "answer": response,
+        "sources": sources,
+        "confidence": confidence,
+        "context": context
+    }
+    if return_context:
+        output["context"]= context
+    return output
+
+result= rag_enhanced("what is tech stack for the project?", rag_retriever, llm, top_k=3, min_score=0.1, return_context=True)
+print(f"Answer: {result['answer']}")
+print(f"Confidence: {result['confidence']:.2f}")
+print("Sources:", result['sources'])
+print("context preview:", result['context'][:500], "...")
+
